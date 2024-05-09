@@ -11,6 +11,7 @@
 import sys
 import pylink
 import argparse
+import openocd
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -62,6 +63,13 @@ class VirtualScreen(QtWidgets.QMainWindow):
         self.pen = QtGui.QPen()
         self.set_pixel_color_rgb()
 
+    @staticmethod
+    def get_frame_buffer(dbg: pylink.JLink | openocd.OpenOcd, *, amount: int, unit_size: int):
+        if isinstance(dbg, openocd.OpenOcd):
+            return dbg.read_memory(address=DISPLAY_VRAM_OFFSET, count=amount, width=unit_size)
+        elif isinstance(dbg, pylink.JLink):
+            return dbg.memory_read(addr=DISPLAY_VRAM_OFFSET, num_units=amount, nbits=unit_size)
+
     def set_pixel_color_rgb(self, color=PIXEL_COLOR, *, size=SCALE):
         """
         Sets the pixel color.
@@ -99,7 +107,7 @@ class VirtualScreen(QtWidgets.QMainWindow):
         Draws the screen, based on the mono-vRAM of the device.
         """
 
-        vram = jlink.memory_read(addr=DISPLAY_VRAM_OFFSET, num_units=self.vram_w * self.vram_pages, nbits=8)
+        vram = self.get_frame_buffer(debugger, amount=self.vram_w * self.vram_pages, unit_size=8)
 
         self.clear_screen()
         for page in range(self.vram_pages):
@@ -117,8 +125,7 @@ class VirtualScreen(QtWidgets.QMainWindow):
         Draws the screen, based on the RGB565-vRAM of the device.
         """
 
-        vram = jlink.memory_read(addr=DISPLAY_VRAM_OFFSET, num_units=self.vram_w * self.vram_h,
-                                 nbits=8 * self.pixel_depth)
+        vram = self.get_frame_buffer(debugger, amount=self.vram_w * self.vram_h, unit_size=8 * self.pixel_depth)
 
         self.clear_screen()
         for row in range(self.vram_h):
@@ -144,47 +151,59 @@ def get_params():
     mcu: str = parser.parse_args().mcu
     dbg: str = parser.parse_args().interface
     draw_mode: str = parser.parse_args().display
-    disp_size: tuple[int, int] = (parser.parse_args().width, parser.parse_args().height)
-    fps: int = parser.parse_args().fps
+    disp_size = (int(parser.parse_args().width), int(parser.parse_args().height))
+    fps = int(parser.parse_args().fps)
 
-    return mcu.upper(), dbg.strip().lower(), draw_mode.strip().lower(), disp_size, fps
+    return mcu.strip().upper(), dbg.strip().lower(), draw_mode.strip().lower(), disp_size, fps
 
 
 if __name__ == "__main__":
     target_mcu, debug_interface, display_type, display_size, framerate = get_params()
 
-    # Opens JLink interface.
-    jlink = pylink.JLink()
-    jlink.open()
-    jlink.rtt_start()
-    print(jlink.product_name)
+    if target_mcu == "OPENOCD":
 
-    # Connects with the MCU.
-    jlink.set_tif(
-        pylink.enums.JLinkInterfaces.JTAG if debug_interface == "jtag" else pylink.enums.JLinkInterfaces.SWD)
-    jlink.connect(target_mcu)
+        debugger = openocd.OpenOcd()
 
-    # Get the display framebuffer location.
-    rtt_out = []
-    while len(rtt_out) < 1:
-        rtt_out = jlink.rtt_read(0, 200)
+        try:
+            debugger.connect()
+        except ConnectionRefusedError:
+            sys.exit("Failed to connect to OpenOCD device. Did you started the OpenOCD server?")
 
-    rtt_buffer_data = ''.join(chr(val) for val in rtt_out).split("\n")
-
-    for data in rtt_buffer_data:
-        if data.startswith("D-VRAM:"):
-            DISPLAY_VRAM_OFFSET = int(data[8:], 16)
-            print(f"D-VRAM (display data buffer) reported at: 0x{DISPLAY_VRAM_OFFSET:X}")
-            break
+        # print(debugger.read_memory(0x3ffb_8798, 10, 8))
     else:
-        raise NameError("The code must send via RTT the address of the display frame buffer ('D-VRAM').\n"
-                        "The message should follow the pattern: 'D-VRAM: <address>'\n"
-                        "e.g.: 'D-VRAM: 0xDEADBEEF'")
 
-    # Starts the virtual screen.
-    emulator = QtWidgets.QApplication(sys.argv)
+        # Opens JLink interface.
+        debugger = pylink.JLink()
+        debugger.open()
+        debugger.rtt_start()
+        print(debugger.product_name)
 
-    screen = VirtualScreen(vram_size=display_size, mode=display_type, fps=framerate)
-    screen.show()
+        # Connects with the MCU.
+        debugger.set_tif(
+            pylink.enums.JLinkInterfaces.JTAG if debug_interface == "jtag" else pylink.enums.JLinkInterfaces.SWD)
+        debugger.connect(target_mcu)
 
-    emulator.exec_()
+        # Get the display framebuffer location.
+        rtt_out = []
+        while len(rtt_out) < 1:
+            rtt_out = debugger.rtt_read(0, 200)
+
+        rtt_buffer_data = ''.join(chr(val) for val in rtt_out).split("\n")
+
+        for data in rtt_buffer_data:
+            if data.startswith("D-VRAM:"):
+                DISPLAY_VRAM_OFFSET = int(data[8:], 16)
+                print(f"D-VRAM (display data buffer) reported at: 0x{DISPLAY_VRAM_OFFSET:X}")
+                break
+        else:
+            raise NameError("The device must send via RTT the address of the display frame buffer ('D-VRAM').\n"
+                            "The message should follow the pattern: 'D-VRAM: <address>'\n"
+                            "e.g.: 'D-VRAM: 0xDEADBEEF'")
+
+        # Starts the virtual screen.
+        emulator = QtWidgets.QApplication(sys.argv)
+
+        screen = VirtualScreen(vram_size=display_size, mode=display_type, fps=framerate)
+        screen.show()
+
+        emulator.exec_()
