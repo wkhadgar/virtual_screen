@@ -66,7 +66,10 @@ class VirtualScreen(QtWidgets.QMainWindow):
     @staticmethod
     def get_frame_buffer(dbg: pylink.JLink | openocd.OpenOcd, *, amount: int, unit_size: int):
         if isinstance(dbg, openocd.OpenOcd):
-            return dbg.read_memory(address=DISPLAY_VRAM_OFFSET, count=amount, width=unit_size)
+            dbg.halt()
+            fb = dbg.read_memory(address=DISPLAY_VRAM_OFFSET, count=amount, width=unit_size)
+            dbg.resume()
+            return fb
         elif isinstance(dbg, pylink.JLink):
             return dbg.memory_read(addr=DISPLAY_VRAM_OFFSET, num_units=amount, nbits=unit_size)
 
@@ -125,14 +128,32 @@ class VirtualScreen(QtWidgets.QMainWindow):
         Draws the screen, based on the RGB565-vRAM of the device.
         """
 
-        vram = self.get_frame_buffer(debugger, amount=self.vram_w * self.vram_h, unit_size=8 * self.pixel_depth)
+        vram = self.get_frame_buffer(debugger, amount=(self.vram_w * self.vram_h) // 4, unit_size=16 * 4)
 
+        row_offset = self.vram_w // 4
         self.clear_screen()
-        for row in range(self.vram_h):
-            for column in range(self.vram_w):
-                pixel = vram[(column + (row * self.vram_w))]
-                self.set_pixel_color_16(pixel)
-                self.painter.drawPoint(column * VirtualScreen.SCALE, row * VirtualScreen.SCALE)
+        for p_y in range(self.vram_h):
+            i_x = p_x = 0
+            i_y = p_y * row_offset
+            while p_x < self.vram_w:
+                pixel_quartet = vram[i_x + i_y]
+
+                pixel_0 = (pixel_quartet & 0x0000_0000_0000_FFFF)
+                pixel_1 = (pixel_quartet & 0x0000_0000_FFFF_0000) >> 16
+                pixel_2 = (pixel_quartet & 0x0000_FFFF_0000_0000) >> 32
+                pixel_3 = (pixel_quartet & 0xFFFF_0000_0000_0000) >> 48
+
+                self.set_pixel_color_16(pixel_0)
+                self.painter.drawPoint(p_x * VirtualScreen.SCALE, p_y * VirtualScreen.SCALE)
+                self.set_pixel_color_16(pixel_1)
+                self.painter.drawPoint((p_x + 1) * VirtualScreen.SCALE, p_y * VirtualScreen.SCALE)
+                self.set_pixel_color_16(pixel_2)
+                self.painter.drawPoint((p_x + 2) * VirtualScreen.SCALE, p_y * VirtualScreen.SCALE)
+                self.set_pixel_color_16(pixel_3)
+                self.painter.drawPoint((p_x + 3) * VirtualScreen.SCALE, p_y * VirtualScreen.SCALE)
+
+                i_x += 1
+                p_x += 4
 
         self.update()
 
@@ -147,20 +168,25 @@ def get_params():
     parser.add_argument("--width", metavar="<display width>", help="Width of the display.", default=128)
     parser.add_argument("--height", metavar="<display height>", help="Height of the display.", default=64)
     parser.add_argument("-f", "--fps", metavar="<frame rate>", help="Emulated framerate.", default=60)
+    parser.add_argument("-a", "--address", metavar="<address>", help="Frame buffer address, only used if mcu=OpenOCD.",
+                        default="0")
 
     mcu: str = parser.parse_args().mcu
     dbg: str = parser.parse_args().interface
     draw_mode: str = parser.parse_args().display
     disp_size = (int(parser.parse_args().width), int(parser.parse_args().height))
     fps = int(parser.parse_args().fps)
+    addr = int(parser.parse_args().address, 16)
 
-    return mcu.strip().upper(), dbg.strip().lower(), draw_mode.strip().lower(), disp_size, fps
+    return mcu.strip().upper(), dbg.strip().lower(), draw_mode.strip().lower(), disp_size, fps, addr
 
 
 if __name__ == "__main__":
-    target_mcu, debug_interface, display_type, display_size, framerate = get_params()
+    target_mcu, debug_interface, display_type, display_size, framerate, address = get_params()
 
     if target_mcu == "OPENOCD":
+        if address == 0:
+            sys.exit("Parameter <address> must be specified if mcu=OpenOCD (-h for help).")
 
         debugger = openocd.OpenOcd()
 
@@ -169,7 +195,11 @@ if __name__ == "__main__":
         except ConnectionRefusedError:
             sys.exit("Failed to connect to OpenOCD device. Did you started the OpenOCD server?")
 
-        # print(debugger.read_memory(0x3ffb_8798, 10, 8))
+        cores = debugger.targets()
+        debugger.execute(f"targets {cores[0]}")
+
+        # Get the address of the display buffer. (this should be manually updated)
+        DISPLAY_VRAM_OFFSET = address
     else:
 
         # Opens JLink interface.
@@ -197,13 +227,13 @@ if __name__ == "__main__":
                 break
         else:
             raise NameError("The device must send via RTT the address of the display frame buffer ('D-VRAM').\n"
-                            "The message should follow the pattern: 'D-VRAM: <address>'\n"
+                            "The message must be sent in boot (asap) and follow the pattern: 'D-VRAM: <address>'\n"
                             "e.g.: 'D-VRAM: 0xDEADBEEF'")
 
-        # Starts the virtual screen.
-        emulator = QtWidgets.QApplication(sys.argv)
+    # Starts the virtual screen.
+    emulator = QtWidgets.QApplication(sys.argv)
 
-        screen = VirtualScreen(vram_size=display_size, mode=display_type, fps=framerate)
-        screen.show()
+    screen = VirtualScreen(vram_size=display_size, mode=display_type, fps=framerate)
+    screen.show()
 
-        emulator.exec_()
+    emulator.exec_()
